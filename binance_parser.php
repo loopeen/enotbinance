@@ -1,5 +1,12 @@
 <?php
 
+use GuzzleHttp\Client;
+use GuzzleHttp\Exception\RequestException;
+use GuzzleHttp\Pool;
+use GuzzleHttp\Psr7\Request;
+use GuzzleHttp\Psr7\Response;
+use Psr\Http\Message\ResponseInterface;
+
 class BinanceParser
 {
 
@@ -13,15 +20,25 @@ class BinanceParser
     {
         $this->proxy = is_null($proxy) ? null : ($proxy["ip"] . ":" . $proxy["port"]);
         $this->proxyAuth = is_null($proxy) ? null : ($proxy["login"] . ":" . $proxy["password"]);
-        $this->proxyType = is_null($proxy) ? null : ($proxy["type"] == "socks5" ? CURLPROXY_SOCKS5 : CURLPROXY_HTTPS);
+        $this->proxyType = is_null($proxy) ? null : $proxy["type"];
+        $this->adsList = [];
+        $this->client = new Client();
+        if ($this->proxy) {
+            $proxy = $this->proxyType . "://" . $this->proxyAuth . "@" . $this->proxy;
+            $this->client = new Client([
+                "proxy" => $proxy
+            ]);
+        }
+
     }
 
     //получение списка методов
     public function getMethods($fiat = "RUB")
     {
-        $methods = $this->request($this::GET_METHODS_URL, [
-            "fiat" => $fiat
+        $methods = $this->client->post($this::GET_METHODS_URL, [
+            "json" => ["fiat" => $fiat]
         ]);
+        $methods = json_decode($methods->getBody()->getContents(), true);
         if ($methods["code"] == 000000) {
             $methodsList = [];
             foreach ($methods["data"]["tradeMethods"] as $method) {
@@ -34,54 +51,107 @@ class BinanceParser
     //получение списка объявлений
     public function getAds($payTypes = [], $count = 30, $asset = "USDT", $tradeType = "BUY", $fiat = "RUB")
     {
-        $adsList = [];
 
-        for ($i = 0; $i < ceil($count / 10); $i++) {
-            $ads = $this->request($this::GET_ADS_URL, [
-                "page" => $i + 1,
-                "rows" => 10,
-                "payTypes" => $payTypes,
-                "publisherType" => null,
-                "asset" => $asset,
-                "tradeType" => $tradeType,
-                "fiat" => $fiat
-            ]);
-
-            if ($ads["code"] == 000000) {
-                array_push($adsList, ...$ads["data"]);
+        $getAdsRequests = function () use ($count, $payTypes, $asset, $tradeType, $fiat) {
+            foreach ($payTypes as $payType) {
+                for ($i = 0; $i < ceil($count / 10); $i++) {
+                    yield function () use ($count, $payType, $asset, $tradeType, $fiat, $i) {
+                        return $this->client->postAsync($this::GET_ADS_URL, [
+                            "headers" =>  ["Content-Type" => "application/json"],
+                            "json" => [
+                                "page" => $i + 1,
+                                "rows" => 10,
+                                "payTypes" => [$payType],
+                                "publisherType" => null,
+                                "asset" => $asset,
+                                "tradeType" => $tradeType,
+                                "fiat" => $fiat
+                            ]
+                        ])->then(function (Response $response) use ($payType) {
+                            $json = json_decode($response->getBody()->getContents(), true);
+                            if (!isset($this->adsList[$payType])) $this->adsList[$payType] = [];
+                            if ($json["code"] == 000000) array_push($this->adsList[$payType], ...$json["data"]);
+                            return $response;
+                        });
+                    };
+                }
             }
+        };
+
+        $getAdsPool = new Pool($this->client, $getAdsRequests(), [
+            'concurrency' => 90,
+        ]);
+        $promise = $getAdsPool->promise();
+        $promise->wait();
+
+        $this->getSellers();
+
+        foreach ($this->adsList as $key1 => $ads) {
+            $this->adsList[$key1] = [$this->getSafetyAdFromList($ads)];
+            if (!isset($this->adsList[$key1][0]["price"])) $this->adsList[$key1] = [];
         }
 
-        $adsList = array_slice($adsList, 0, $count);
-
-        foreach ($adsList as $key => $ad) {
-            $seller = $this->getSeller($ad["advertiser"]["userNo"]);
-
-            $ad["sellerInfo"] = $seller;
-            $adsList[$key] = $this->formatAd($ad);
-        }
-
-        return $adsList;
+        return $this->adsList;
     }
 
-    //получение информации о продавце
-    public function getSeller($userNo)
+    //получение информации о продавцах
+    public function getSellers()
     {
-        $seller = $this->request($this::GET_SELLER_INFO . $userNo, [], "GET");
-        if ($seller["code"] == 000000) {
-            $stats = $this->getSellerReviewsStats($userNo);
-            $seller["data"]["userDetailVo"]["userStatsRet"]["reviewsStats"] = $stats;
-            return $seller["data"];
-        }
+        $getSellersRequests = function () {
+            foreach ($this->adsList as $key1 => $ads) {
+                foreach ($ads as $key2 => $ad) {
+                    yield function () use ($key1, $key2, $ad) {
+                        return $this->client->getAsync($this::GET_SELLER_INFO . (isset($ad["advertiser"]["userNo"]) ? $ad["advertiser"]["userNo"] : ''))->then(function (Response $response) use ($key1, $key2) {
+                            $json = json_decode($response->getBody()->getContents(), true);
+                            if ($json["code"] == 000000) {
+                                $this->adsList[$key1][$key2]["sellerInfo"] = $json["data"];
+                            }
+                            return $response;
+                        });
+                    };
+                }
+            }
+        };
+
+        $getSellersPool = new Pool($this->client, $getSellersRequests(), [
+            'concurrency' => 90,
+        ]);
+
+        $promise = $getSellersPool->promise();
+        $promise->wait();
+
+        return $this->getSellersReviewsStats();
     }
 
-    //получение статистики отзывов о продавце
-    public function getSellerReviewsStats($userNo)
+    //получение статистики отзывов о продавцах
+    public function getSellersReviewsStats()
     {
-        $stats = $this->request($this::GET_SELLER_REVIEWS_STATS, ["userNo" => $userNo]);
-        if ($stats["code"] == 000000) {
-            return $stats["data"];
-        }
+        $getSellerReviewsStatsRequests = function () {
+            foreach ($this->adsList as $key1 => $ads) {
+                foreach ($ads as $key2 => $ad) {
+                    yield function () use ($key1, $key2, $ad) {
+                        $userNo = isset($ad["sellerInfo"]["userDetailVo"]["userNo"]) ? $ad["sellerInfo"]["userDetailVo"]["userNo"] : '';
+                        return $this->client->postAsync($this::GET_SELLER_REVIEWS_STATS, ["json" => ["userNo" => $userNo]])->then(function (Response $response) use ($key1, $key2) {
+                            $json = json_decode($response->getBody()->getContents(), true);
+                            if ($json["code"] == 000000) {
+                                $this->adsList[$key1][$key2]["sellerInfo"]["userDetailVo"]["userStatsRet"]["reviewsStats"] = $json["data"];
+                                $this->adsList[$key1][$key2] = $this->formatAd($this->adsList[$key1][$key2]);
+                            }
+                            return $response;
+                        });
+                    };
+                }
+            }
+        };
+
+        $getSellerReviewsStatsPool = new Pool($this->client, $getSellerReviewsStatsRequests(), [
+            'concurrency' => 90,
+        ]);
+
+
+        $promise = $getSellerReviewsStatsPool->promise();
+        $promise->wait();
+        return true;
     }
 
     //форматирование объявления, фильтрация лишней информации
@@ -137,31 +207,5 @@ class BinanceParser
         $z = 1.64485;
         $phat = $up / $n;
         return ($phat + $z * $z / (2 * $n) - $z * sqrt(($phat * (1 - $phat) + $z * $z / (4 * $n)) / $n)) / (1 + $z * $z / $n);
-    }
-
-    //функция отправки запросов
-    private function request($url, $data=[], $method = "POST", $headers = [
-        "Content-Type: application/json"
-    ])
-    {
-        $ch = curl_init($url);
-        $payload = json_encode($data);
-        if ($method == "POST") {
-            curl_setopt($ch, CURLOPT_POSTFIELDS, $payload);
-            curl_setopt($ch, CURLOPT_HTTPHEADER, $headers);
-        } else {
-            curl_setopt($ch, CURLOPT_SSL_VERIFYPEER, false);
-            curl_setopt($ch, CURLOPT_HEADER, false);
-        }
-        if ($this->proxy && $this->proxyAuth && $this->proxyType) {
-            curl_setopt($ch, CURLOPT_PROXY, $this->proxy);
-            curl_setopt($ch, CURLOPT_PROXYUSERPWD, $this->proxyAuth);
-            curl_setopt($ch, CURLOPT_PROXYTYPE, $this->proxyType); // If expected to call with specific PROXY type
-        }
-        curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
-        $response = curl_exec($ch);
-        curl_close($ch);
-
-        return json_decode($response, true);
     }
 }
